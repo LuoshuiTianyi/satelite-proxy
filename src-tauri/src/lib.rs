@@ -191,10 +191,11 @@ pub fn run() {
             app.manage(app_state);
             app_log::info("app", "Satelite started");
 
-            // Born at the persisted window size before the WebView paints —
-            // resizing after paint reads as a grow animation (same file as
-            // the tray-recreate path, see window_ctrl::show_main).
-            window_ctrl::restore_main_window_size(app.handle());
+            // Born at the persisted window size and position before the
+            // WebView paints — resizing or moving after paint reads as an
+            // animation (same file as the tray-recreate path, see
+            // window_ctrl::show_main).
+            window_ctrl::restore_main_window_layout(app.handle());
 
             // Pin the title bar to the stored theme before the window paints —
             // otherwise it starts on the OS light/dark mode and can mismatch
@@ -415,11 +416,13 @@ pub fn run() {
             commands::list_subscriptions,
             commands::list_subscription_urls,
             commands::get_subscription,
+            commands::get_subscription_raw_config,
+            commands::get_subscription_core_support,
             commands::add_subscription_url,
             commands::add_subscription_file,
             commands::add_subscription_text,
             commands::add_subscription_node,
-            commands::add_subscription_singbox,
+            commands::add_subscription_custom,
             commands::read_import_file,
             commands::update_subscription,
             commands::refresh_subscription,
