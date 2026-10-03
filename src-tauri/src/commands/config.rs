@@ -366,9 +366,10 @@ pub fn update_settings(
             }
             if let Some(list) = protocol_cores {
                 // Normalize: trim + lowercase both sides, dedupe by protocol
-                // (first wins), keep only real delegations. Unknown values are
-                // harmless (never match a node) — the build-time plan
-                // re-checks each node against the sidecar core support anyway.
+                // (first wins), keep only real delegations. Values that match
+                // no node protocol are harmless — the build-time plan
+                // re-checks each node against the sidecar core support anyway
+                // (`unknown` matches rescued raw-passthrough nodes).
                 let sidecar_cores = [
                     crate::core::CoreKind::Xray.as_str(),
                     crate::core::CoreKind::Mihomo.as_str(),
@@ -563,13 +564,19 @@ pub fn list_all_nodes(state: State<'_, AppState>) -> Result<Vec<ListedNode>, Str
                 .map(|s| s.id.as_str())
                 .collect();
             // Under a core that cannot serve a protocol, such nodes are
-            // hidden from listings entirely (they reappear after switching).
+            // hidden from listings entirely (they reappear after switching)
+            // — unless multi-core delegation carries them (protocol pinned
+            // to a sidecar core that serves the node, e.g. unknown raw
+            // types → mihomo sidecar).
             let core_kind = crate::core::CoreKind::parse(&store.settings.core_type);
             Ok(store
                 .nodes
                 .iter()
                 .filter(|n| enabled.contains(n.subscription_id.as_str()))
-                .filter(|n| core_kind.supports_node(&n.node))
+                .filter(|n| {
+                    core_kind.supports_node(&n.node)
+                        || crate::runtime::node_delegatable(&store.settings, &n.node)
+                })
                 .map(|n| ListedNode {
                     node: wire_node(n.node.clone()),
                     latency_method: n.latency_method.clone(),
@@ -633,7 +640,10 @@ pub fn list_nodes_page(
                 .nodes
                 .iter()
                 .filter(|n| enabled.contains(n.subscription_id.as_str()))
-                .filter(|n| core_kind.supports_node(&n.node))
+                .filter(|n| {
+                    core_kind.supports_node(&n.node)
+                        || crate::runtime::node_delegatable(&store.settings, &n.node)
+                })
                 .filter(|n| {
                     query.is_empty()
                         || n.node.name.to_lowercase().contains(&query)
@@ -697,7 +707,10 @@ pub fn list_node_ids(
                 .nodes
                 .iter()
                 .filter(|n| enabled.contains(n.subscription_id.as_str()))
-                .filter(|n| core_kind.supports_node(&n.node))
+                .filter(|n| {
+                    core_kind.supports_node(&n.node)
+                        || crate::runtime::node_delegatable(&store.settings, &n.node)
+                })
                 .filter(|n| {
                     query.is_empty()
                         || n.node.name.to_lowercase().contains(&query)

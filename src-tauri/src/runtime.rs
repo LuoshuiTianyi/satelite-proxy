@@ -2583,6 +2583,31 @@ pub(crate) fn compute_sidecar_plan(
     }
 }
 
+/// Whether a node the main core can't serve natively is still carried by the
+/// active runtime via multi-core delegation: its protocol must be pinned to
+/// a sidecar core that serves the exact node. Mirrors the candidacy check of
+/// [`compute_sidecar_plan`] (without port/chain/reserved-port refinements —
+/// a chain-pinned node stays native and is filtered at generation with a
+/// logged reason, delegated or not). Used wherever listings / selection /
+/// smart-switch candidates previously filtered by the main core's
+/// `supports_node` alone, so delegated nodes (e.g. rescued OpenVPN entries
+/// under the sing-box main core + mihomo sidecar) stay visible and usable
+/// there too.
+pub(crate) fn node_delegatable(settings: &crate::domain::AppSettings, node: &ProxyNode) -> bool {
+    if !settings.multi_core_enabled
+        || CoreKind::parse(&settings.core_type) != CoreKind::SingBox
+        || settings.runtime_source().is_custom()
+    {
+        return false;
+    }
+    settings
+        .protocol_cores
+        .iter()
+        .find(|e| e.protocol == node.protocol.as_str())
+        .map(|e| CoreKind::parse(&e.core))
+        .is_some_and(|k| k != CoreKind::SingBox && k.supports_node(node))
+}
+
 /// macOS-only: find a `utunN` index with no existing interface, for Xray's
 /// TUN inbound (see `BuildOptions::tun_interface_name`). Falls back to
 /// `utun9` (matching the error message's own example) if `ifconfig` itself
@@ -2978,6 +3003,49 @@ mod sidecar_plan_tests {
         );
         assert_eq!(plan.used_kinds(), vec![CoreKind::Xray, CoreKind::Mihomo]);
         assert_eq!(plan.entries_for(CoreKind::Mihomo).len(), 1);
+    }
+
+    fn unknown_node(id: &str) -> ProxyNode {
+        let mut n = node(id, Protocol::Unknown);
+        n.raw = Some("type: openvpn\nserver: o.example.com\nport: 1194\nca: xxx".into());
+        n
+    }
+
+    #[test]
+    fn unknown_nodes_delegate_to_mihomo_when_pinned() {
+        // Rescued raw-passthrough types (openvpn/ssr/mieru) are Unknown
+        // protocol nodes — delegatable only when "unknown" is pinned to a
+        // sidecar core, and only with a raw body the sidecar can embed.
+        let mut store = sidecar_store();
+        let ovpn = unknown_node("ov1");
+        assert!(compute_sidecar_plan(&store.settings, &store.chains, &[ovpn.clone()]).is_none());
+        assert!(!node_delegatable(&store.settings, &ovpn));
+
+        store
+            .settings
+            .protocol_cores
+            .push(crate::domain::ProtocolCoreItem {
+                protocol: "unknown".into(),
+                core: "mihomo".into(),
+            });
+        let plan =
+            compute_sidecar_plan(&store.settings, &store.chains, &[ovpn.clone()]).expect("plan");
+        assert_eq!(plan.ports, vec![sp("ov1", 20890, CoreKind::Mihomo)]);
+        assert!(node_delegatable(&store.settings, &ovpn));
+
+        // Gates: multi-core off / non-singbox main core both veto delegation.
+        store.settings.multi_core_enabled = false;
+        assert!(!node_delegatable(&store.settings, &ovpn));
+        store.settings.multi_core_enabled = true;
+        store.settings.core_type = "xray".into();
+        assert!(!node_delegatable(&store.settings, &ovpn));
+        store.settings.core_type = "singbox".into();
+
+        // A raw-less Unknown has nothing the sidecar can embed — stays out.
+        let mut rawless = node("ov2", Protocol::Unknown);
+        rawless.raw = None;
+        assert!(!node_delegatable(&store.settings, &rawless));
+        assert!(compute_sidecar_plan(&store.settings, &store.chains, &[rawless]).is_none());
     }
 
     #[test]

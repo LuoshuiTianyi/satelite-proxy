@@ -359,7 +359,7 @@ const en = {
   "settings.multiCoreFollowMain": "Follow main core",
   "settings.multiCoreMasqueDisabled": "Disabled",
   "settings.multiCoreTableHint":
-    "Pinned protocols egress through the chosen sidecar core (Xray or mihomo — e.g. Hysteria2 works on either). MASQUE is mihomo-only (sing-box and Xray have no masque outbound): unpinned it reads Disabled and its nodes are filtered from the config. Unsupported transport combinations fall back to native sing-box outbounds automatically.",
+    "Pinned protocols egress through the chosen sidecar core (Xray or mihomo — e.g. Hysteria2 works on either). MASQUE is mihomo-only (sing-box and Xray have no masque outbound): unpinned it reads Disabled and its nodes are filtered from the config. OpenVPN* covers unmodeled mihomo-native types (OpenVPN / SSR / Mieru, carried as verbatim raw entries): pinning it routes those nodes through the mihomo sidecar, and under the mihomo main core they are always usable. Unsupported transport combinations fall back to native sing-box outbounds automatically.",
   "settings.multiCoreNoProtocols":
     "No protocol is pinned to a sidecar yet — the sidecar process starts once you route at least one protocol below.",
   "settings.multiCorePort": "Sidecar base port",
@@ -1499,7 +1499,7 @@ const zh: Record<MessageKey, string> = {
   "settings.multiCoreFollowMain": "跟随主内核",
   "settings.multiCoreMasqueDisabled": "未启用",
   "settings.multiCoreTableHint":
-    "已钉选的协议经所选副内核转发（Xray 或 mihomo——如 Hysteria2 两者皆可）。MASQUE 仅 mihomo 支持（sing-box 与 Xray 均无 masque 出站），未钉选时显示未启用、其节点被过滤出配置；传输组合不被目标内核支持时自动回退 sing-box 原生出站。",
+    "已钉选的协议经所选副内核转发（Xray 或 mihomo——如 Hysteria2 两者皆可）。MASQUE 仅 mihomo 支持（sing-box 与 Xray 均无 masque 出站），未钉选时显示未启用、其节点被过滤出配置；OpenVPN* 覆盖未建模的 mihomo 原生类型（OpenVPN / SSR / Mieru，以原文条目透传承载），钉选后这些节点经 mihomo 副进程转发、mihomo 主内核下始终可用；传输组合不被目标内核支持时自动回退 sing-box 原生出站。",
   "settings.multiCoreNoProtocols":
     "尚未把任何协议钉到副内核——至少在下方把一个协议选为 Xray / mihomo 后，副进程才会启动。",
   "settings.multiCorePort": "副进程端口基址",

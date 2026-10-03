@@ -1410,8 +1410,12 @@ impl AppState {
             // Node-level compatibility (protocol / per-core node-shape
             // transport limits) lives in CoreKind::supports_node — the same
             // predicate that filters listings and generation, so a pick can
-            // never desync from what the config actually contains.
-            if !core_kind.supports_node(node) {
+            // never desync from what the config actually contains. Nodes the
+            // main core can't serve but sidecar delegation carries are real
+            // members of the running config, so they pass too.
+            if !core_kind.supports_node(node)
+                && !crate::runtime::node_delegatable(&store.settings, node)
+            {
                 return Err(crate::error::AppError::Core(format!(
                     "{} 内核不支持该节点（协议/传输/REALITY 限制），请切换内核或选择其他节点",
                     core_kind.display_name()

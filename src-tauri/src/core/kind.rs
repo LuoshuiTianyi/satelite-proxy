@@ -303,7 +303,7 @@ impl CoreKind {
         }
         if !self.supports(node.protocol) {
             return Some(match self {
-                Self::SingBox => "未建模类型：仅 mihomo 内核支持原文透传",
+                Self::SingBox => "未建模类型：仅 mihomo 支持原文透传（多核模式可委托 mihomo）",
                 Self::Xray => "Xray 不支持该协议",
                 Self::Mihomo => "mihomo 不支持该协议",
             });

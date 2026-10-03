@@ -1937,6 +1937,47 @@ dialer-proxy: 不存在的节点
         );
     }
 
+    /// A rescued openvpn entry: `Protocol::Unknown` + verbatim raw body
+    /// (parse path: `MIHOMO_UNMODELED_TYPES`). Model fields are projections —
+    /// generation must embed the raw entry with only the name rewritten.
+    fn openvpn_node(name: &str) -> ProxyNode {
+        let mut n = ss_node(name);
+        n.protocol = Protocol::Unknown;
+        n.server = "o.example.com".into();
+        n.port = 1194;
+        n.raw = Some(format!(
+            "name: {name}\ntype: openvpn\nserver: o.example.com\nport: 1194\n\
+             protocol: udp\ncipher: AES-256-GCM\nusername: u\npassword: p\n\
+             ca: |\n  -----BEGIN CERTIFICATE-----\n  MIIBfake\n  -----END CERTIFICATE-----\n"
+        ));
+        n
+    }
+
+    #[test]
+    fn openvpn_unknown_raw_passthrough_shape() {
+        let node = openvpn_node("ov");
+        let tag = node_tag_of(&node);
+        // Main config: verbatim entry under the rewritten tag.
+        let built = build_mihomo_config(&[node.clone()], &default_opts()).expect("build");
+        let doc = parse(&built);
+        let proxy = &doc["proxies"][0];
+        assert_eq!(proxy["type"].as_str(), Some("openvpn"));
+        assert_eq!(proxy["name"].as_str(), Some(tag.as_str()));
+        assert_eq!(proxy["server"].as_str(), Some("o.example.com"));
+        assert_eq!(proxy["cipher"].as_str(), Some("AES-256-GCM"));
+        assert!(
+            proxy["ca"]
+                .as_str()
+                .is_some_and(|c| c.contains("BEGIN CERTIFICATE")),
+            "ca block must ride along verbatim"
+        );
+        // Sidecar config: same entry + the loopback listener pinned to it.
+        let side = build_mihomo_sidecar_config(&[(node, 20890u16)]).expect("sidecar build");
+        let sdoc = parse(&side);
+        assert_eq!(sdoc["proxies"][0]["type"].as_str(), Some("openvpn"));
+        assert_eq!(sdoc["listeners"][0]["proxy"].as_str(), Some(tag.as_str()));
+    }
+
     /// `cargo test --lib config::mihomo::tests::live_mihomo_sidecar_config_validates -- --ignored`
     #[test]
     #[ignore]
@@ -1968,6 +2009,71 @@ dialer-proxy: 不存在的节点
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    /// Self-signed CA for the openvpn live test — mihomo PEM-parses the
+    /// inline `ca` block at config build, so it must be a real certificate.
+    const OPENVPN_LIVE_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIC7zCCAdegAwIBAgIUYB9B48G3fOOaO6yVD+VTrk4WFO8wDQYJKoZIhvcNAQEL
+BQAwIDEeMBwGA1UEAwwVc2F0ZWxpdGUtb3BlbnZwbi10ZXN0MB4XDTI2MTAwMzA2
+MDIwNFoXDTM2MDkzMDA2MDIwNFowIDEeMBwGA1UEAwwVc2F0ZWxpdGUtb3BlbnZw
+bi10ZXN0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvS2Z1eVieLjP
+4brEefHlcqe04At5B7CeZmrtrvZwRZ18f+g34dzBWXjxJ4oAQRGavHODdSP1cSaa
+aiOuDT37wM7WwL9TtThoef2zscvk8fzONBWkemSGMJ6a+VP/ytV/zJzA/x6Q2+UH
+z2IoJJ9+XcikZh+QwsTB945KPSN1Nd4BSU3a8KoYJMNX0k+tgSJpmcurzxA+GTDW
+MGi1/Kk1p055rTBv5e8wlcIn4q5HIeTsFBjeDjo358s1fJht8LVSl3HtIwGlP9QK
+i6IZl/fgjb5PxzEcEuzqYFZ08eGYzgvwza2JcFa4MSWdrm5TaG+HRnSPdWMNZFu0
+gUhSJyR+RQIDAQABoyEwHzAdBgNVHQ4EFgQUj+/JU80URdTG7GpITSlcz9gmOrIw
+DQYJKoZIhvcNAQELBQADggEBAItyx5QkJVM+RMu7c2Br98vHrMl+qhv74r7JSKGH
+FM42IlOYqDhdSkjp4h8JxyNrZ2uRCNHtH8ikDoV2BElSY5fIakblpljssz2RCe4L
+maTUjO61EhaFZaQOLNkgJqrp3ATW1vWmUInvM86mg72udWT6pDnVnEAU+KwYv/xM
+hmGz28We73k6iersHQf5kWsaRQTpITVUgE2EHAg5kB+yNuRR6ixG+dbke7ZWmqfb
+3rxAHfPYvKtB3zbtjMOfxUjfBPeZWAs793oXrxdqM+x+7aBy+byJYGyYqrgBm9eh
+Dh8aZf9uMe34poL6mGQxVWTsiVWSiQbcgOzxHI8Bu6Vebx4=
+-----END CERTIFICATE-----
+";
+
+    /// `cargo test --lib config::mihomo::tests::live_mihomo_openvpn_raw_validates -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_mihomo_openvpn_raw_validates() {
+        let bin = crate::core::find_bundled_core(None, CoreKind::Mihomo)
+            .expect("bundled mihomo binary — run the fetch-bundled-mihomo script");
+        let mut node = openvpn_node("live");
+        node.raw = Some(format!(
+            "name: live\ntype: openvpn\nserver: 127.0.0.1\nport: 1194\nprotocol: udp\n\
+             cipher: AES-256-GCM\nusername: u\npassword: p\nca: |\n{}\n",
+            OPENVPN_LIVE_CA
+                .lines()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        let main = build_mihomo_config(&[node.clone()], &default_opts()).expect("main build");
+        let side = build_mihomo_sidecar_config(&[(node, 20890u16)]).expect("sidecar build");
+        for (label, built) in [("main", &main), ("sidecar", &side)] {
+            let tmp = std::env::temp_dir().join(format!(
+                "satelite-mihomo-openvpn-live-{label}-{}-{}.yaml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(&tmp, &built.yaml).unwrap();
+            let output = std::process::Command::new(&bin)
+                .args(["-t", "-f"])
+                .arg(&tmp)
+                .output()
+                .expect("spawn mihomo");
+            let _ = std::fs::remove_file(&tmp);
+            assert!(
+                output.status.success(),
+                "mihomo -t rejected the {label} openvpn config:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
