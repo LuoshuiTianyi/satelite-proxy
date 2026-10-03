@@ -37,8 +37,10 @@ const GRID_ROW_HEIGHT = 94;
 const NODE_GROUP_H = 30;
 /** List view column template — shared by the head row and every data row so
  *  they align without relying on native <table> auto-layout (dropped so the
- *  group header row can span full width and grow past a single line). */
-const NODE_LIST_COLS = "40px minmax(0,1.44fr) 90px minmax(0,1fr) 70px 90px";
+ *  group header row can span full width and grow past a single line).
+ *  Columns: lead / name / subscription / proto / host / port / latency. */
+const NODE_LIST_COLS =
+  "40px minmax(0,1.3fr) minmax(0,0.85fr) 90px minmax(0,1fr) 70px 90px";
 /** .node-grid-virtual row gap (10px, tighter than the resting 0.65rem) —
  *  a spanning header row is followed by the gap before the next card row,
  *  so its pitch includes it. */
@@ -56,30 +58,25 @@ function gridColumns() {
 /** Flat render items with per-item heights: the virtualizer runs in pixel
  *  space (itemSize=1) and a prefix-offset window maps px → items, which
  *  keeps slim headers + collapsible groups exact. */
-type ListItem =
-  | {
-      type: "group";
-      key: string;
-      label: string;
-      flag?: string;
-      count: number;
-      h: number;
-    }
-  | { type: "node"; n: ProxyNode; h: number };
+/** Group header band — shared shape between the list and grid item unions.
+ *  Carries the group's nodes so the header's per-group test buttons can
+ *  scope a probe run without a lookup. */
+type GroupHeaderItem = {
+  type: "group";
+  key: string;
+  label: string;
+  flag?: string;
+  count: number;
+  nodes: ProxyNode[];
+  h: number;
+};
+
+type ListItem = GroupHeaderItem | { type: "node"; n: ProxyNode; h: number };
 /** Grid items are row-granular: one item = one row of cards carrying the
  *  full row pitch. Charging every card the full row height (the pre-fix
  *  bug) overstated the virtual total ~cols× and the initial window only
  *  rendered a couple of rows past the fold. */
-type GridItem =
-  | {
-      type: "group";
-      key: string;
-      label: string;
-      flag?: string;
-      count: number;
-      h: number;
-    }
-  | { type: "row"; nodes: ProxyNode[]; h: number };
+type GridItem = GroupHeaderItem | { type: "row"; nodes: ProxyNode[]; h: number };
 
 /** Render latency cell: spinner / ms / timeout / needs-core / dash */
 function LatencyDisplay({
@@ -165,6 +162,9 @@ export function NodesPage() {
   const [customLatency, setCustomLatency] = useState<CustomLatencyMap>(new Map());
   const [testing, setTesting] = useState(false);
   const [testingIds, setTestingIds] = useState<Set<string>>(new Set());
+  // Key of the group a scoped (per-group header button) test is running for;
+  // null = the run, if any, came from the toolbar and covers every group.
+  const [testingGroupKey, setTestingGroupKey] = useState<string | null>(null);
   // Which probe the current/last run used — "real" rides the kernel's proxy
   // path, "ping" is direct TCP; drives button labels and the unsupported note.
   const [testKind, setTestKind] = useState<"real" | "ping">("real");
@@ -382,6 +382,7 @@ export function NodesPage() {
         label: g.label,
         flag: g.flag,
         count: g.nodes.length,
+        nodes: g.nodes,
         h: NODE_GROUP_H,
       });
       if (open) {
@@ -416,6 +417,7 @@ export function NodesPage() {
         label: g.label,
         flag: g.flag,
         count: g.nodes.length,
+        nodes: g.nodes,
         h: NODE_GROUP_H + GRID_GAP,
       });
       if (open) pushRows(g.nodes);
@@ -530,14 +532,39 @@ export function NodesPage() {
     // is also reachable from stale renders — refuse instead of degrading to
     // a silent TCP ping.
     if (kind === "real" && xrayCore) return;
-    setTesting(true);
-    setTestKind(kind);
-    setError(null);
     // Ids in current display order — the backend launches probes (and
     // streams results back) top to bottom of the list as shown. Custom mode
-    // probes the extracted (unsaved) nodes — ids come from the loaded list
-    // because they are not in the node store.
+    // probes the extracted (unsaved) nodes as a whole — ids come from the
+    // loaded list because they are not in the node store.
     const ids = customRuntime ? nodes.map((n) => n.id) : await listNodeIds(query, sortMode);
+    await runBatchTest(kind, ids, null);
+  }
+
+  /** Per-group header buttons: the same batch body scoped to one group's
+   *  node ids. Store-backed runs only — custom-mode extracted nodes can't
+   *  be addressed by id (the buttons are hidden there). */
+  async function onTestGroup(kind: "real" | "ping", group: GroupHeaderItem) {
+    if (testing || group.nodes.length === 0) return;
+    if (kind === "real" && xrayCore) return;
+    await runBatchTest(
+      kind,
+      group.nodes.map((n) => n.id),
+      group.key,
+    );
+  }
+
+  /** Batch-run body shared by the toolbar (all displayed nodes) and the
+   *  per-group header buttons (one group's ids). groupKey is null for the
+   *  toolbar run — a group header only spins for its own scoped run. */
+  async function runBatchTest(
+    kind: "real" | "ping",
+    ids: string[],
+    groupKey: string | null,
+  ) {
+    setTesting(true);
+    setTestKind(kind);
+    if (groupKey !== null) setTestingGroupKey(groupKey);
+    setError(null);
     const idSet = new Set(ids);
     setTestingIds(idSet);
 
@@ -596,16 +623,24 @@ export function NodesPage() {
 
     try {
       // Custom mode can't map into the running config, so both probes are
-      // the same direct-TCP path there.
+      // the same direct-TCP path there (group runs never reach this — their
+      // extracted nodes can't be addressed by id).
       const batch = customRuntime
         ? await testCustomNodesLatency(3000, buffer.push)
         : kind === "ping"
           ? await pingNodesLatency(ids, 3000, buffer.push)
           : await testNodesLatency(ids, 3000, buffer.push);
       buffer.flushNow();
-      setUnsupportedIds(
-        new Set(batch.results.filter((r) => r.method === "unsupported").map((r) => r.id)),
-      );
+      setUnsupportedIds((prev) => {
+        // This run's ids start fresh (a re-test clears stale marks), then
+        // unsupported results are re-added — a group-scoped run leaves
+        // other groups' marks untouched.
+        const next = new Set(prev);
+        for (const id of idSet) next.delete(id);
+        for (const r of batch.results)
+          if (r.method === "unsupported") next.add(r.id);
+        return next;
+      });
     } catch (e) {
       buffer.flushNow();
       setError(typeof e === "string" ? e : String(e));
@@ -613,6 +648,7 @@ export function NodesPage() {
     } finally {
       setTesting(false);
       setTestingIds(new Set());
+      setTestingGroupKey(null);
       // Custom results are session-only — keep the merged values instead of
       // re-reading the latency-less extracted list.
       if (!customRuntime) await reload();
@@ -830,6 +866,57 @@ export function NodesPage() {
     }
   }
 
+  /** Per-group header test buttons (right edge of the band): real latency /
+   *  TCP ping scoped to this group's nodes only. stopPropagation keeps the
+   *  header's collapse toggle from firing; hidden in custom runtime where
+   *  extracted nodes can't be addressed by id. */
+  function renderGroupActions(item: GroupHeaderItem) {
+    if (customRuntime || item.nodes.length === 0) return null;
+    const groupTesting = testing && testingGroupKey === item.key;
+    return (
+      <span className="node-group-actions">
+        <button
+          type="button"
+          className="node-group-test-btn"
+          disabled={testing || xrayCore}
+          title={
+            xrayCore
+              ? t("nodes.realLatencyXrayUnsupported")
+              : t("nodes.groupTestRealHint")
+          }
+          aria-label={t("nodes.groupTestRealHint")}
+          onClick={(e) => {
+            e.stopPropagation();
+            void onTestGroup("real", item);
+          }}
+        >
+          {groupTesting && testKind === "real" ? (
+            <span className="lat-spinner" aria-hidden />
+          ) : (
+            "◉"
+          )}
+        </button>
+        <button
+          type="button"
+          className="node-group-test-btn"
+          disabled={testing}
+          title={t("nodes.groupTestPingHint")}
+          aria-label={t("nodes.groupTestPingHint")}
+          onClick={(e) => {
+            e.stopPropagation();
+            void onTestGroup("ping", item);
+          }}
+        >
+          {groupTesting && testKind === "ping" ? (
+            <span className="lat-spinner" aria-hidden />
+          ) : (
+            "∿"
+          )}
+        </button>
+      </span>
+    );
+  }
+
   /** Slim collapsible group header row (list). Plain div, not a table row —
    *  spans the full row width so it can grow past a single line later
    *  without fighting native <table> row-height rules. */
@@ -850,6 +937,7 @@ export function NodesPage() {
           {item.label}
         </span>
         <span className="node-group-count mono">{item.count}</span>
+        {renderGroupActions(item)}
       </div>
     );
   }
@@ -871,6 +959,7 @@ export function NodesPage() {
           {item.label}
         </span>
         <span className="node-group-count mono">{item.count}</span>
+        {renderGroupActions(item)}
       </div>
     );
   }
@@ -907,11 +996,13 @@ export function NodesPage() {
                     </span>
                     <span>
                       <div className="node-list-name">{n.name}</div>
-                      {n.subscription_name ? (
-                        <div className="node-sub-label">
-                          {n.subscription_name}
-                        </div>
-                      ) : null}
+                    </span>
+                    <span className="node-list-sub">
+                      {/* Own ellipsis box — the cell is a flex container, so
+                          text-overflow must live on this inner span. */}
+                      <span className="node-sub-label">
+                        {n.subscription_name}
+                      </span>
                     </span>
                     <span>
                       {/* No title anywhere inside the row: the whole row is
@@ -1174,6 +1265,7 @@ export function NodesPage() {
             <div className="node-list-head" style={{ gridTemplateColumns: NODE_LIST_COLS }}>
               <span></span>
               <span>{t("nodes.sortName")}</span>
+              <span>{t("nodes.groupSub")}</span>
               <span>proto</span>
               <span>host</span>
               <span>port</span>
