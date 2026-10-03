@@ -6089,6 +6089,16 @@ tr.dns-diag-tr:hover {
 
 .instrument-kv .kv-v {
   color: var(--muted);
+  /* Value swaps ("—" <-> an IP/version/byte count) must never change the
+     row height: wrap -> ellipsis keeps every kv line exactly one line tall,
+     so periodic polling cannot make the bottom instrument row jump. */
+  display: inline-block;
+  vertical-align: bottom;
+  min-width: 0;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Exit-IP row of the network-probe card: keep long IPv6 answers on one
@@ -6697,6 +6707,12 @@ tr.dns-diag-tr:hover {
   font-size: 1.12rem;
   line-height: 1.22;
   white-space: normal;
+  /* Bounded to two lines: the enabled-subscription card must keep a
+     constant height whether the name list renders one line or many. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 
 .instrument-subscription-names.wrap > span {
