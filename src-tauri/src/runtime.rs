@@ -1072,20 +1072,16 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Readiness wait shared by the sing-box start paths: polls the Clash API
-    /// (plus the mixed-inbound dial when `mixed_port` is given) until ready,
-    /// the window closes, or the core exits. Returns `(ok, api_seen_ok)`.
+    /// Readiness wait shared by the sing-box start paths: polls the Clash API,
+    /// the mixed inbound, and the Windows TUN adapter when TUN is enabled.
+    /// A core is not Running until all required ingress paths are ready.
     ///
     /// The base window is short because the runtime lock is held here — but a
     /// TUN start whose log shows sing-tun's slow-interface WARN (`open
     /// interface take too much time to finish!`) is evidence the core is
-    /// booting, not wedged: clash_api only comes up after the tun inbound
-    /// finishes. While that evidence is present and the core is alive, the
-    /// deadline is pushed out to `TUN_STARTUP_STALL_CAP` instead of killing
-    /// the core mid-boot — kill + restart churns the wintun adapter, which
-    /// makes the next attempt slower still (2026-08 field report: TUN never
-    /// came up on a conflict-heavy Windows host because every retry killed
-    /// the core at the 10s mark).
+    /// booting, not wedged. While that evidence is present and the core is
+    /// alive, the deadline is pushed out to `TUN_STARTUP_STALL_CAP` instead of
+    /// killing the core mid-boot.
     fn wait_clash_api_ready(
         &mut self,
         elevated: bool,
@@ -1106,16 +1102,19 @@ impl Runtime {
             if Instant::now() >= deadline {
                 break;
             }
+
+            let tun_ready = !elevated || tun_interface_ready();
             if api.health_ok() {
                 api_seen_ok = true;
-                // The control API responding is not enough to claim success —
-                // the mixed inbound must accept connections too (a core whose
-                // inbound never bound would otherwise be reported running).
-                if mixed_port.map(dial_mixed_ok).unwrap_or(true) {
+                // The control API and mixed inbound can come up before
+                // sing-tun finishes creating its adapter. Keep the core in
+                // Starting until the TUN interface is observable too.
+                if mixed_port.map(dial_mixed_ok).unwrap_or(true) && tun_ready {
                     ok = true;
                     break;
                 }
             }
+
             std::thread::sleep(std::time::Duration::from_millis(200));
             self.core.poll();
             if !self.core.is_running() {
@@ -1268,35 +1267,41 @@ impl Runtime {
         let log_dir = app_data_dir.join("logs");
         // TUN creates utun + routes → macOS setuid sing-box / Windows UAC.
         let elevated = store.settings.tun_enabled;
-        self.core.start_with_ports(
-            CoreKind::SingBox,
-            &bin,
-            &config_path,
-            &log_dir,
-            store.settings.mixed_port,
-            Some(store.settings.api_port),
-            &store
-                .settings
-                .extra_inbounds
-                .iter()
-                .map(|inb| inb.port)
-                .collect::<Vec<_>>(),
-            elevated,
-            resource_dir,
-        )?;
-        self.last_config_path = Some(config_path.clone());
-        self.last_binary_path = Some(bin.clone());
+        let extra_ports = store
+            .settings
+            .extra_inbounds
+            .iter()
+            .map(|inb| inb.port)
+            .collect::<Vec<_>>();
+        let mut retried_tun_start = false;
 
-        let api = ClashApi::new("127.0.0.1", store.settings.api_port, &secret);
-        // TUN start can take a few seconds (utun + routes) — or much longer
-        // when the wintun adapter itself is slow to come up. Health uses a
-        // short base window (we hold the runtime lock here), extended on
-        // slow-TUN log evidence (see `wait_clash_api_ready`).
-        let (ok, api_seen_ok) =
-            self.wait_clash_api_ready(elevated, &api, Some(store.settings.mixed_port));
-        if !ok {
+        loop {
+            self.core.start_with_ports(
+                CoreKind::SingBox,
+                &bin,
+                &config_path,
+                &log_dir,
+                store.settings.mixed_port,
+                Some(store.settings.api_port),
+                &extra_ports,
+                elevated,
+                resource_dir,
+            )?;
+            self.last_config_path = Some(config_path.clone());
+            self.last_binary_path = Some(bin.clone());
+
+            let api = ClashApi::new("127.0.0.1", store.settings.api_port, &secret);
+            // API/mixed can be live before sing-tun has created its adapter;
+            // readiness also requires the TUN interface when enabled.
+            let (ok, api_seen_ok) =
+                self.wait_clash_api_ready(elevated, &api, Some(store.settings.mixed_port));
+            if ok {
+                self.api = Some(api);
+                self.core_started_at = Some(now_unix_secs());
+                break;
+            }
+
             let log_hint = self.core_startup_log_hint();
-            let _ = self.core.stop();
             let what = crate::core::manager::map_core_startup_hint(&readiness_failure_detail(
                 "sing-box",
                 api_seen_ok,
@@ -1308,14 +1313,34 @@ impl Runtime {
             } else {
                 format!("{what}\n--- log ---\n{log_hint}")
             };
-            // The slow-TUN WARN only ever lives in the log tail — map it on
-            // the composed detail so the failure names the real culprit.
+            let _ = self.core.stop();
+
+            #[cfg(target_os = "windows")]
+            let should_retry =
+                elevated && !retried_tun_start && is_tun_adapter_start_error(&detail);
+            #[cfg(not(target_os = "windows"))]
+            let should_retry = false;
+
+            if should_retry {
+                retried_tun_start = true;
+                if !wait_for_tun_interface_released(Duration::from_secs(5)) {
+                    crate::app_log::warn(
+                        "core",
+                        "retrying TUN start even though the old adapter is still present",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                crate::app_log::warn(
+                    "core",
+                    "transient TUN adapter startup failure; retrying once",
+                );
+                continue;
+            }
+
             return Err(AppError::Core(
                 crate::core::manager::map_slow_tun_start_hint(&detail),
             ));
         }
-        self.api = Some(api);
-        self.core_started_at = Some(now_unix_secs());
 
         // Main core healthy — now bring up the companion sidecars (if
         // delegated), one process per used core kind in plan order. Failure
@@ -2255,7 +2280,7 @@ impl Runtime {
     /// Internal restarts deliberately use this path so the saved/effective
     /// system-proxy state survives the short process replacement. A user
     /// initiated stop must use `stop_proxy`, which restores the OS first.
-    fn stop_core(&mut self, _store: &AppStore) -> AppResult<()> {
+    fn stop_core(&mut self, store: &AppStore) -> AppResult<()> {
         if let Some(api) = self.api.take() {
             api.deactivate();
         }
@@ -2268,7 +2293,13 @@ impl Runtime {
         // the next start's begin-with-stop cleans it up again.
         self.stop_all_sidecars();
         self.core.stop()?;
-        // `CoreManager::stop` waits for the process we actually own. Never
+        #[cfg(target_os = "windows")]
+        if store.settings.tun_enabled && !wait_for_tun_interface_released(Duration::from_secs(5)) {
+            crate::app_log::warn(
+                "core",
+                "TUN adapter did not disappear within 5s after core stop; retry may still conflict",
+            );
+        }
         // force-kill arbitrary listeners here: an empty/test runtime has no
         // ownership proof and could otherwise terminate another running app
         // instance (or an unrelated process using the configured ports).
@@ -2375,6 +2406,61 @@ fn ensure_listen_port_available_on(port: u16, host: &str, label: &str) -> AppRes
         )));
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn tun_interface_present() -> bool {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces.iter().any(|interface| {
+                let name = interface.name.to_ascii_lowercase();
+                name == "tun0" || name.contains("sing-tun")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn tun_interface_present() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn tun_interface_ready() -> bool {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces.iter().any(|interface| {
+                let name = interface.name.to_ascii_lowercase();
+                let is_satelite_tun = name == "tun0" || name.contains("sing-tun");
+                is_satelite_tun
+                    && matches!(
+                        interface.ip(),
+                        std::net::IpAddr::V4(ip)
+                            if ip == std::net::Ipv4Addr::new(172, 19, 0, 1)
+                    )
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn tun_interface_ready() -> bool {
+    true
+}
+
+fn wait_for_tun_interface_released(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while tun_interface_present() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !tun_interface_present()
+}
+
+fn is_tun_adapter_start_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    (lower.contains("create adapter")
+        && (lower.contains("already exists") || lower.contains("element not found")))
+        || lower.contains("device attached to the system is not functioning")
 }
 
 /// True once the local mixed inbound actually accepts TCP connections.
@@ -3783,5 +3869,30 @@ mod passive_failure_tests {
         let stats = runtime.passive_node_stats("node-m", 60_000);
         assert_eq!(stats.total, 1);
         assert_eq!(stats.suspicious, 0);
+    }
+}
+
+#[cfg(test)]
+mod tun_start_tests {
+    use super::is_tun_adapter_start_error;
+
+    #[test]
+    fn recognizes_wintun_adapter_conflicts() {
+        assert!(is_tun_adapter_start_error(
+            "create adapter: Cannot create a file when that file already exists. | open existing adapter: Element not found."
+        ));
+        assert!(is_tun_adapter_start_error(
+            "configure tun interface: A device attached to the system is not functioning."
+        ));
+    }
+
+    #[test]
+    fn ignores_non_tun_startup_errors() {
+        assert!(!is_tun_adapter_start_error(
+            "listen tcp 127.0.0.1:7890: address already in use"
+        ));
+        assert!(!is_tun_adapter_start_error(
+            "failed to parse config: unknown field"
+        ));
     }
 }
